@@ -106,6 +106,15 @@ var clientHelp = `
 
 	--pid Generate pid file in current working directory
 
+    --audit, Emit a structured per-connection audit log to stderr in addition
+    to the normal output. Each entry is a single line tagged "[audit]"
+    followed by JSON containing the route rule (R:<local-port>:<host>:<port>),
+    destination, success flag, latency, duration, and bytes transferred in
+    each direction. Use this to confirm whether traffic was received for a
+    given route and whether the forward to the target succeeded. Pipe through
+    jq for analysis, e.g.:
+        outsystemscc --audit ... 2>&1 | grep '\[audit\]' | sed 's/.*\[audit\] //' | jq .
+
     -v, Enable verbose logging
 
     --help, This help text
@@ -129,6 +138,7 @@ func client(args []string) {
 	flags.Var(&headerFlags{config.Headers}, "header", "")
 	hostname := flags.String("hostname", "", "Deprecated, will be ignored")
 	pid := flags.Bool("pid", false, "")
+	audit := flags.Bool("audit", false, "")
 	verbose := flags.Bool("v", false, "")
 	flags.Usage = func() {
 		fmt.Print(clientHelp)
@@ -158,7 +168,24 @@ func client(args []string) {
 	serverURL := fetchURL(createHTTPClient(&config), args[0])
 
 	config.Server = fmt.Sprintf("%s%s", serverURL, queryParams)
-	config.Remotes = args[1:]
+
+	// If --audit is set, interpose a local TCP proxy on each reverse remote
+	// so we can record per-connection metrics. The local-port the operator
+	// configured stays the same; only the host:port chisel dials gets
+	// rewritten to point at 127.0.0.1:<auto-allocated>.
+	remotes := args[1:]
+	if *audit {
+		log.Printf("[audit] mode enabled - emitting per-connection records as [audit] <json>")
+		rewritten, proxies, err := startAuditProxies(remotes)
+		if err != nil {
+			log.Fatal(err)
+		}
+		// Tear down listeners on shutdown. cos.InterruptContext cancels on
+		// SIGINT/SIGTERM; once chisel.Wait returns we close the proxies.
+		defer stopAuditProxies(proxies)
+		remotes = rewritten
+	}
+	config.Remotes = remotes
 
 	//default auth
 	if config.Auth == "" {
