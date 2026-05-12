@@ -107,12 +107,16 @@ var clientHelp = `
 	--pid Generate pid file in current working directory
 
     --exlog, Emit a structured per-connection extra log to stderr in addition
-    to the normal output. Each entry is a single line tagged "[exlog]"
-    followed by JSON containing the route rule (R:<local-port>:<host>:<port>),
-    destination, success flag, latency, duration, and bytes transferred in
-    each direction. Use this to confirm whether traffic was received for a
-    given route and whether the forward to the target succeeded. Pipe through
-    jq for analysis, e.g.:
+    to the normal output. Two entries are emitted per connection, both tagged
+    "[exlog]" followed by JSON, sharing the same conn_id:
+        - event="open"  emitted immediately on accept; answers
+                         "did we receive traffic for this route?"
+        - event="close" emitted on teardown; carries success flag, latency,
+                         duration, and bytes transferred each direction.
+    Within the exlog stream, conn_id ties the pair together. Across the
+    chisel and exlog streams, correlation is by time and order: chisel logs
+    "client: tun: conn#N: Open" immediately before our matching open event.
+    Pipe through jq for analysis, e.g.:
         outsystemscc --exlog ... 2>&1 | grep '\[exlog\]' | sed 's/.*\[exlog\] //' | jq .
 
     -v, Enable verbose logging

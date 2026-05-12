@@ -19,20 +19,37 @@ import (
 //	"Did we receive traffic for R:<port>:<host>:<port>, and was the forward
 //	to the target successful?"
 //
-// One entry is emitted per inbound connection received from the chisel
-// tunnel, when that connection terminates.
+// Two entries are emitted per inbound connection received from the chisel
+// tunnel, sharing the same ConnID:
+//
+//	Event=="open"   when the connection is accepted from the tunnel.
+//	                Answers "did we receive traffic?" at arrival-time.
+//	Event=="close"  when the connection terminates.
+//	                Carries the dial outcome and transferred-byte counts.
+//
+// Within the exlog stream, ConnID joins the two events for a single TCP
+// connection. Across the chisel and exlog log streams, correlation is by
+// time proximity and order: chisel logs "client: tun: conn#N: Open"
+// immediately before dialling our local proxy, so its open event lands
+// right before our matching exlogEntry{Event:"open"}.
 type exlogEntry struct {
 	Timestamp   string `json:"timestamp"`
+	ConnID      uint64 `json:"conn_id"`
+	Event       string `json:"event"`           // "open" or "close"
 	RouteRule   string `json:"route_rule"`      // original "R:local:host:remote"
 	Destination string `json:"destination"`     // resolved "host:port" of target
 	SourceAddr  string `json:"source_addr"`     // remote addr of incoming conn (chisel side)
-	Success     bool   `json:"success"`         // did dial to target succeed?
-	LatencyMs   int64  `json:"latency_ms"`      // time to establish conn to target
-	DurationMs  int64  `json:"duration_ms"`     // total connection lifetime
-	BytesIn     int64  `json:"bytes_in"`        // bytes from tunnel -> target
-	BytesOut    int64  `json:"bytes_out"`       // bytes from target -> tunnel
-	Error       string `json:"error,omitempty"` // populated on failure
+	Success     bool   `json:"success"`         // close-only: did dial to target succeed?
+	LatencyMs   int64  `json:"latency_ms"`      // close-only: time to establish conn to target
+	DurationMs  int64  `json:"duration_ms"`     // close-only: total connection lifetime
+	BytesIn     int64  `json:"bytes_in"`        // close-only: bytes from tunnel -> target
+	BytesOut    int64  `json:"bytes_out"`       // close-only: bytes from target -> tunnel
+	Error       string `json:"error,omitempty"` // close-only: populated on failure
 }
+
+// nextConnID hands out monotonic identifiers used to tie the open/close
+// events for a single proxied connection together. Reset on process start.
+var nextConnID atomic.Uint64
 
 // exlogEmitter is the sink for exlog entries. Tests override this to capture
 // emitted records. The default writes a single tagged line per entry to the
@@ -135,33 +152,51 @@ func (p *exlogProxy) serve() {
 	}
 }
 
-// handle owns the lifecycle of a single proxied connection: dial the target,
-// pipe data both directions, and emit exactly one exlog entry on close.
+// handle owns the lifecycle of a single proxied connection: emit an "open"
+// exlog entry on accept, dial the target, pipe data both directions, and
+// emit a matching "close" exlog entry on teardown. Both entries share the
+// same ConnID.
 func (p *exlogProxy) handle(client net.Conn) {
+	connID := nextConnID.Add(1)
+	sourceAddr := client.RemoteAddr().String()
 	start := time.Now()
-	entry := exlogEntry{
+
+	// Open event: emitted immediately so an operator can confirm traffic
+	// arrived for this route without waiting for the connection to close.
+	exlogEmitter(exlogEntry{
+		Timestamp:   start.UTC().Format(time.RFC3339Nano),
+		ConnID:      connID,
+		Event:       "open",
 		RouteRule:   p.routeRule,
 		Destination: p.target,
-		SourceAddr:  client.RemoteAddr().String(),
-		Timestamp:   start.UTC().Format(time.RFC3339Nano),
-	}
+		SourceAddr:  sourceAddr,
+	})
 
+	// Close event: built up below; emitted exactly once on return.
+	closeEntry := exlogEntry{
+		ConnID:      connID,
+		Event:       "close",
+		RouteRule:   p.routeRule,
+		Destination: p.target,
+		SourceAddr:  sourceAddr,
+	}
 	defer func() {
-		entry.DurationMs = time.Since(start).Milliseconds()
-		exlogEmitter(entry)
+		closeEntry.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
+		closeEntry.DurationMs = time.Since(start).Milliseconds()
+		exlogEmitter(closeEntry)
 	}()
 	defer client.Close()
 
 	dialStart := time.Now()
 	target, err := net.DialTimeout("tcp", p.target, exlogDialTimeout)
-	entry.LatencyMs = time.Since(dialStart).Milliseconds()
+	closeEntry.LatencyMs = time.Since(dialStart).Milliseconds()
 	if err != nil {
-		entry.Success = false
-		entry.Error = err.Error()
+		closeEntry.Success = false
+		closeEntry.Error = err.Error()
 		return
 	}
 	defer target.Close()
-	entry.Success = true
+	closeEntry.Success = true
 
 	var bytesIn, bytesOut int64
 	var wg sync.WaitGroup
@@ -189,8 +224,8 @@ func (p *exlogProxy) handle(client net.Conn) {
 	}()
 
 	wg.Wait()
-	entry.BytesIn = atomic.LoadInt64(&bytesIn)
-	entry.BytesOut = atomic.LoadInt64(&bytesOut)
+	closeEntry.BytesIn = atomic.LoadInt64(&bytesIn)
+	closeEntry.BytesOut = atomic.LoadInt64(&bytesOut)
 }
 
 // remoteSpec is the subset of a chisel remote definition we care about for exlog purposes.

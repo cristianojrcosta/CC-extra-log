@@ -174,40 +174,56 @@ func Test_exlogProxy_successfulForward(t *testing.T) {
 	}
 	_ = conn.Close()
 
-	// Wait for the exlog entry to be emitted (proxy completes asynchronously).
+	// Wait for both exlog entries (open + close) to be emitted.
 	deadline := time.Now().Add(2 * time.Second)
 	var entries []exlogEntry
 	for time.Now().Before(deadline) {
 		entries = getEntries()
-		if len(entries) >= 1 {
+		if len(entries) >= 2 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 exlog entry, got %d", len(entries))
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 exlog entries (open+close), got %d", len(entries))
 	}
-	e := entries[0]
-	if e.RouteRule != original {
-		t.Errorf("RouteRule = %q, want %q", e.RouteRule, original)
+
+	open, closed := entries[0], entries[1]
+	if open.Event != "open" {
+		t.Errorf("entries[0].Event = %q, want %q", open.Event, "open")
 	}
-	if e.Destination != echoAddr {
-		t.Errorf("Destination = %q, want %q", e.Destination, echoAddr)
+	if closed.Event != "close" {
+		t.Errorf("entries[1].Event = %q, want %q", closed.Event, "close")
 	}
-	if !e.Success {
-		t.Errorf("Success = false, want true; error=%q", e.Error)
+	if open.ConnID == 0 {
+		t.Errorf("ConnID should be non-zero")
 	}
-	if e.BytesIn != int64(len(payload)) {
-		t.Errorf("BytesIn = %d, want %d", e.BytesIn, len(payload))
+	if open.ConnID != closed.ConnID {
+		t.Errorf("conn_id mismatch: open=%d close=%d", open.ConnID, closed.ConnID)
 	}
-	if e.BytesOut != int64(len(payload)) {
-		t.Errorf("BytesOut = %d, want %d", e.BytesOut, len(payload))
+	if open.SourceAddr != closed.SourceAddr {
+		t.Errorf("source_addr mismatch between open and close events")
 	}
-	if e.Timestamp == "" {
-		t.Errorf("Timestamp empty")
+	if open.RouteRule != original {
+		t.Errorf("open.RouteRule = %q, want %q", open.RouteRule, original)
 	}
-	if e.LatencyMs < 0 {
-		t.Errorf("LatencyMs negative: %d", e.LatencyMs)
+	if closed.Destination != echoAddr {
+		t.Errorf("close.Destination = %q, want %q", closed.Destination, echoAddr)
+	}
+	if !closed.Success {
+		t.Errorf("close.Success = false, want true; error=%q", closed.Error)
+	}
+	if closed.BytesIn != int64(len(payload)) {
+		t.Errorf("BytesIn = %d, want %d", closed.BytesIn, len(payload))
+	}
+	if closed.BytesOut != int64(len(payload)) {
+		t.Errorf("BytesOut = %d, want %d", closed.BytesOut, len(payload))
+	}
+	if open.Timestamp == "" || closed.Timestamp == "" {
+		t.Errorf("Timestamp empty (open=%q close=%q)", open.Timestamp, closed.Timestamp)
+	}
+	if closed.LatencyMs < 0 {
+		t.Errorf("LatencyMs negative: %d", closed.LatencyMs)
 	}
 }
 
@@ -252,22 +268,28 @@ func Test_exlogProxy_targetUnreachable(t *testing.T) {
 	var entries []exlogEntry
 	for time.Now().Before(deadline) {
 		entries = getEntries()
-		if len(entries) >= 1 {
+		if len(entries) >= 2 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 exlog entry, got %d", len(entries))
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 exlog entries (open+close), got %d", len(entries))
 	}
-	e := entries[0]
-	if e.Success {
-		t.Errorf("Success = true, want false")
+	open, closed := entries[0], entries[1]
+	if open.Event != "open" || closed.Event != "close" {
+		t.Fatalf("unexpected event sequence: open=%q close=%q", open.Event, closed.Event)
 	}
-	if e.Error == "" {
-		t.Errorf("Error empty, want a dial failure message")
+	if open.ConnID != closed.ConnID || open.ConnID == 0 {
+		t.Errorf("conn_id mismatch or zero: open=%d close=%d", open.ConnID, closed.ConnID)
 	}
-	if e.BytesIn != 0 || e.BytesOut != 0 {
-		t.Errorf("expected zero bytes on failure, got in=%d out=%d", e.BytesIn, e.BytesOut)
+	if closed.Success {
+		t.Errorf("close.Success = true, want false")
+	}
+	if closed.Error == "" {
+		t.Errorf("close.Error empty, want a dial failure message")
+	}
+	if closed.BytesIn != 0 || closed.BytesOut != 0 {
+		t.Errorf("expected zero bytes on failure, got in=%d out=%d", closed.BytesIn, closed.BytesOut)
 	}
 }
